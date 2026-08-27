@@ -10,3 +10,6 @@
 
 # kernel-matrix run output (build/kernel-matrix.sh)
 /.kmatrix/
+
+# Demo TLS certs, generated on first run of demo/tls-run.sh
+demo/.certs/
