@@ -1,24 +1,69 @@
-// Status rail: brand, total switch rate across all CPUs, and the live
-// min-slice knob value (what +/- patches into the kernel). A one-row Box
-// tinted as the rail via the container's own bg — full width, no fragile
-// space-fill.
-import { Box, Text, idx } from "yeet:tui";
-import { fmtDuration, fmtRate } from "@/lib/format.js";
+// Status rail: brand, live counters, the read/write split, and the probe
+// state. One row, bg-tinted via the container.
+import { Box, Text } from "yeet:tui";
+import { commands, stats, status } from "@/probes/mongo.js";
+import {
+  C_BAD, C_BRAND, C_DIM, C_RAIL, C_READ, C_TITLE, C_WARN, C_WRITE,
+  fmtDuration, fmtRate,
+} from "@/lib/format.js";
 
-const RAIL = idx(235);
-const sep = () => <Text fg={idx(240)}>{"  ▏  "}</Text>;
+const sep = () => <Text fg={C_DIM}>{"  ▏ "}</Text>;
 
-export default ({ cpus, minSlice }) => (
-  <Box height="1" direction="row" bg={RAIL}>
-    <Text break="none">
-      {() => {
-        const total = cpus.get().reduce((s, c) => s + c.rate, 0);
-        return [
-          <Text bold fg={idx(214)}>{" ● cpusched "}</Text>, sep(),
-          <Text bold>{fmtRate(total)}</Text>, <Text fg={idx(245)}>{" switches/s"}</Text>, sep(),
-          <Text fg={idx(245)}>{"min-slice ≥ "}</Text>, <Text bold>{fmtDuration(minSlice.get() * 1000)}</Text>, <Text fg={idx(240)}>{"  [ +/- ]"}</Text>,
-        ];
-      }}
-    </Text>
-  </Box>
-);
+export default function TitleBar({ frozen, pinned, filter }) {
+  return (
+    <Box height="1" direction="row" bg={C_RAIL}>
+      <Text break="none">
+        {() => {
+          const s = stats.get();
+          const st = status.get();
+          const out = [<Text bold fg={C_BRAND}>{" ◉ mongosnoop "}</Text>];
+
+          // A probe that failed to attach says so here instead of throwing a
+          // stack over the UI (CLAUDE.md crash-handling boundary 1).
+          if (st !== "tracing") {
+            out.push(sep(), <Text fg={C_WARN}>{st}</Text>);
+            return out;
+          }
+
+          out.push(
+            sep(),
+            <Text bold fg={C_TITLE}>{`${s.tracked}`}</Text>,
+            <Text fg={C_DIM}>{" commands "}</Text>,
+            sep(),
+            <Text fg={C_TITLE}>{`${fmtRate(s.cmdRate)}/s`}</Text>,
+            <Text fg={C_DIM}>{"  "}</Text>,
+            <Text fg={C_READ}>{`▼${fmtRate(s.readRate)}`}</Text>,
+            <Text fg={C_DIM}>{" read "}</Text>,
+            <Text fg={C_WRITE}>{`▲${fmtRate(s.writeRate)}`}</Text>,
+            <Text fg={C_DIM}>{" write"}</Text>,
+          );
+
+          // The slowest command in the last window — the number you actually
+          // watch when you're chasing a latency spike.
+          if (s.slowest > 0) {
+            out.push(
+              sep(),
+              <Text fg={C_DIM}>{"peak "}</Text>,
+              <Text bold fg={C_TITLE}>{fmtDuration(s.slowest)}</Text>,
+            );
+          }
+
+          // Footgun count across the retained log, so a problem that scrolled
+          // past is still visible in the rail.
+          const guns = commands.get().filter((c) => c.footgun).length;
+          if (guns) {
+            out.push(sep(), <Text bold fg={C_BAD}>{`⚠ ${guns}`}</Text>, <Text fg={C_DIM}>{" footguns"}</Text>);
+          }
+
+          if (pinned.get()) out.push(sep(), <Text bold fg={C_WARN}>{"⏸ PAUSED"}</Text>);
+          else if (frozen.get()) out.push(sep(), <Text bold fg={C_WARN}>{"⏸ HOLD"}</Text>);
+
+          const q = filter.get();
+          if (q) out.push(sep(), <Text fg={C_DIM}>{"/"}</Text>, <Text fg={C_TITLE}>{q}</Text>);
+
+          return out;
+        }}
+      </Text>
+    </Box>
+  );
+}

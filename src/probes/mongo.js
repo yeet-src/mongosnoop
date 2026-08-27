@@ -26,21 +26,33 @@ const OP = { MSG: 2013, COMPRESSED: 2012, QUERY: 2004 };
 const CAP = 2000; // most-recent commands retained (scrollback depth)
 const WINDOW_MS = 250; // snapshot cadence — one re-render per window, not per event
 
-// exe path is relative to the *running module's* dir. Bundled (the default
-// `yeet run`, entry src/main.jsx) that's src/ → ../bin. Standalone
-// (`yeet run src/probes/mongo.js`, import.meta.main true) it's src/probes/ →
-// ../../bin. esbuild rewrites import.meta.main to false in the bundle, so this
-// picks the right depth in both cases.
-const OBJ = {
-  exe: import.meta.main ? "../../bin/probe.bpf.o" : "../bin/probe.bpf.o",
-  base: import.meta.dirname,
-};
+// The exe path is relative to the *running module's* dir, and that dir differs
+// between the two ways this module runs:
+//
+//   bundled     `yeet run .`                  → src/index.jsx   → ../bin
+//   standalone  `yeet run src/probes/mongo.js` → src/probes/    → ../../bin
+//
+// sqlitefeed picks between them with `import.meta.main`, on the assumption that
+// esbuild rewrites it to false in the bundle. It does NOT in this yeet version
+// — the bundle keeps the expression live, so it stays truthy and the bundled
+// run looks for bin/ one directory too high. Rather than depend on that, try
+// both depths and keep whichever opens.
+const CANDIDATES = ["../bin/probe.bpf.o", "../../bin/probe.bpf.o"];
 
-const load = () =>
-  new BpfObject(OBJ)
-    .bind("mongo_events", { kind: "ringbuf", btf_struct: "mongo_event" })
-    .bind("probe.data", { kind: "data" })
-    .start();
+const load = async () => {
+  let lastErr;
+  for (const exe of CANDIDATES) {
+    try {
+      return await new BpfObject({ exe, base: import.meta.dirname })
+        .bind("mongo_events", { kind: "ringbuf", btf_struct: "mongo_event" })
+        .bind("probe.data", { kind: "data" })
+        .start();
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+};
 
 // Decode a NUL-terminated char[] (or already-a-string) to JS text. No
 // TextDecoder in bare V8 — hand-roll it, stopping at the first NUL.
@@ -233,7 +245,15 @@ export const commands = from((state) => {
 
 // Standalone correctness probe: dump raw events so field names/types are
 // verifiable before any UI exists (AGENTS.md "get the data right first").
-if (import.meta.main) {
+//
+// Guarded on this module being the entry BY PATH, not on `import.meta.main`.
+// The bundle inlines this module into src/index.jsx, and there `import.meta`
+// belongs to the bundle — which IS the entry — so an `import.meta.main` guard
+// is true in the bundled app too and the dump loop runs instead of the TUI.
+// Checking the filename keeps the self-test to the standalone invocation.
+const isEntry = /probes\/mongo\.js$/.test(import.meta.url ?? "");
+
+if (isEntry) {
   const ctl = await load();
   const rb = new RingBuf(ctl, "mongo_events");
   const opName = { 2013: "OP_MSG", 2012: "OP_COMPRESSED", 2004: "OP_QUERY" };
