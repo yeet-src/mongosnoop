@@ -1,0 +1,8 @@
+{
+  "name": "mongosnoop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "mongosnoop — a yeet script.",
+  "dependencies": {}
+}
