@@ -43,7 +43,7 @@ if ! $DOCKER ps --format '{{.Names}}' | grep -qx "$NAME"; then
 		--tlsAllowConnectionsWithoutCertificates >/dev/null
 	printf '[demo] waiting for mongod'
 	for _ in $(seq 1 60); do
-		if "$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames \
+		if "$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames --tlsAllowInvalidCertificates \
 			--host 127.0.0.1 --port "$PORT" --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
 			echo " ready"
 			break
@@ -59,7 +59,15 @@ echo "         yeet run . -- --tls-binary $MONGOSH"
 
 trap 'echo; echo "[demo] leaving $NAME running — remove it with: $DOCKER rm -f $NAME"' EXIT INT TERM
 
+# Fail loudly on the first round rather than spinning silently: a demo that
+# retries a broken connection forever looks identical to one with no traffic.
+if ! "$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames --tlsAllowInvalidCertificates \
+	--host 127.0.0.1 --port "$PORT" "$DIR/tls-workload.js" 2>&1 | tail -3; then
+	echo "error: the workload could not reach mongod on :$PORT — see the message above" >&2
+	exit 1
+fi
+
 while true; do
-	"$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames \
+	"$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames --tlsAllowInvalidCertificates \
 		--host 127.0.0.1 --port "$PORT" "$DIR/tls-workload.js" >/dev/null 2>&1 || true
 done
