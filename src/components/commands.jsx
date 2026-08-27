@@ -12,7 +12,7 @@
 import { Box, Text } from "yeet:tui";
 import {
   C_BAD, C_CMD, C_DIM, C_FIELD, C_MATCH_BG, C_NS, C_READ, C_SEL_BG, C_SHAPE,
-  C_TEXT, C_VALUE, C_WARN, C_WRITE,
+  C_TEXT, C_TLS, C_VALUE, C_WARN, C_WRITE,
   clip, fmtBytes, fmtDuration, fmtValues, heat, latFrac, lpad, pad, rowHeight,
 } from "@/lib/format.js";
 import { fuzzyPositions } from "@/lib/fuzzy.js";
@@ -58,11 +58,14 @@ function CmdRow({ c, sel, q }) {
   return (
     <Box direction="column" bg={sel ? C_SEL_BG : undefined}>
       <Box direction="row" height="1">
-        <Box width="18" overflow="hidden">
+        {/* The lock gets its own fixed cell. It is a wide glyph, so it must
+            not share a column with text or the row shifts by one cell. */}
+        <Text width="2" break="none" fg={C_TLS}>{c.isTls ? "🔒" : "  "}</Text>
+        <Box width="15" overflow="hidden">
           {/* comm is up to 16 chars and the pid can be 7 — clip the NAME and
               keep the pid intact, since the pid is what tells two instances of
               the same binary apart. */}
-          <Text break="none" fg={C_DIM}>{pad(`${clip(c.comm, 10)}/${c.pid}`, 18)}</Text>
+          <Text break="none" fg={C_DIM}>{pad(`${clip(c.comm, 7)}/${c.pid}`, 15)}</Text>
         </Box>
         <Box width="15" overflow="hidden">
           <Text break="none" overflow="ellipsis" bold fg={verbColor}>{hl(c.cmd, verbColor, q)}</Text>
@@ -131,7 +134,8 @@ export default function Commands({ visible, size, scroll, selected, filter, foot
 export function CommandsHeader() {
   return (
     <Box direction="row" height="1">
-      <Text width="18" fg={C_DIM}>{pad("  process", 18)}</Text>
+      <Text width="2" fg={C_DIM}>{"  "}</Text>
+      <Text width="15" fg={C_DIM}>{pad("process", 15)}</Text>
       <Text width="15" fg={C_DIM}>{pad("command", 15)}</Text>
       <Text width="26" fg={C_DIM}>{pad("namespace", 26)}</Text>
       <Text width="1fr" fg={C_DIM}>{"query shape"}</Text>

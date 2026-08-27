@@ -39,14 +39,97 @@ const WINDOW_MS = 250; // snapshot cadence — one re-render per window, not per
 // both depths and keep whichever opens.
 const CANDIDATES = ["../bin/probe.bpf.o", "../../bin/probe.bpf.o"];
 
+// ── TLS attach targets ──────────────────────────────────────────────────────
+//
+// The socket probes see nothing once a connection is encrypted, so the TLS
+// programs hook the crypto library on the application's side of the boundary.
+// There are two shapes of target and we try both:
+//
+//   1. The SYSTEM OpenSSL. One attach to `libssl.so` covers every client that
+//      links it dynamically — Python's _ssl, distro-packaged Node, .NET.
+//
+//   2. STATICALLY-LINKED binaries. Node's official builds bundle BoringSSL, so
+//      there is no libssl to hook. BoringSSL keeps the OpenSSL symbol names and
+//      the Node binary is not stripped, so `SSL_write` is a global text symbol
+//      in the executable itself and a uprobe attaches to it by name. Each such
+//      binary is a distinct target, so these are discovered and attached
+//      per-path rather than once.
+//
+// Not covered, and stated as a limit rather than worked around: Go clients
+// (crypto/tls is pure Go — no C symbol exists to hook) and Java (JSSE lives
+// inside the JVM). A Go or Java app talking to Mongo over TLS shows nothing.
+export const tlsTargets = signal([]);
+
+// Binaries worth trying for a static-TLS attach. Discovered from the running
+// process list rather than hardcoded, so a nvm build, a bundled mongosh, or an
+// Electron app is found the same way /usr/bin/node is.
+const discoverStaticTlsBinaries = async () => {
+  const found = new Map(); // exe path → true, deduped so one attach per binary
+  try {
+    // `exe` is a top-level Process field (the resolved binary path); `comm` is
+    // under stat. One query gets both.
+    const { data } = await yeet.graph.query(`{ procs { exe stat { comm } } }`);
+    for (const p of data?.procs ?? []) {
+      const comm = p?.stat?.comm ?? "";
+      const exe = p?.exe ?? "";
+      if (!exe) continue;
+      // Node-family runtimes are the ones that bundle their own TLS. Match on
+      // either the process name or the binary path, since a bundled tool often
+      // reports its own name (mongosh) rather than node.
+      if (!/(^|\/)(node|mongosh|electron|bun|deno)/i.test(comm) &&
+          !/(^|\/)(node|mongosh|electron|bun|deno)/i.test(exe)) continue;
+      found.set(exe, true);
+    }
+  } catch {
+    // No graph, no discovery — the libssl attach still covers dynamic clients.
+  }
+  return [...found.keys()];
+};
+
 const load = async () => {
   let lastErr;
   for (const exe of CANDIDATES) {
     try {
-      return await new BpfObject({ exe, base: import.meta.dirname })
+      let b = new BpfObject({ exe, base: import.meta.dirname })
         .bind("mongo_events", { kind: "ringbuf", btf_struct: "mongo_event" })
-        .bind("probe.data", { kind: "data" })
-        .start();
+        .bind("probe.data", { kind: "data" });
+
+      // A BPF program can be attached ONCE, so the three TLS programs get one
+      // target each — not one per binary. That makes target choice the whole
+      // problem: `libssl.so` covers every dynamically-linked client at once,
+      // while a statically-linked runtime (Node's official builds, and the
+      // mongosh bundled from one) needs its own binary named explicitly.
+      //
+      // Default is libssl, which is the broadest single choice. Point it at a
+      // static binary instead with `--tls-binary /path/to/node`, and use
+      // `--tls-binary auto` to let discovery pick the first Node-family binary
+      // it finds running.
+      // The arg parser normalises dashes to underscores, so `--tls-binary`
+      // arrives as `tls_binary`. Accept both spellings.
+      let tlsTarget = yeet.args?.tls_binary ?? yeet.args?.["tls-binary"] ?? "libssl.so";
+      if (tlsTarget === "auto") {
+        const found = await discoverStaticTlsBinaries();
+        tlsTarget = found[0] ?? "libssl.so";
+      }
+
+      const attached = [];
+      try {
+        b = b
+          .attach("on_ssl_write", { kind: "uprobe", binary: tlsTarget, symbol: "SSL_write" })
+          // kind is always "uprobe"; the program's SEC() name decides entry vs
+          // return, so on_ssl_read_ret shares this spec shape.
+          .attach("on_ssl_read", { kind: "uprobe", binary: tlsTarget, symbol: "SSL_read" })
+          .attach("on_ssl_read_ret", { kind: "uprobe", binary: tlsTarget, symbol: "SSL_read" });
+        attached.push(tlsTarget);
+      } catch {
+        // No SSL symbols there (stripped build, or no libssl on the box). The
+        // plaintext path still works, so degrade to wire-only rather than
+        // failing the load.
+      }
+
+      const ctl = await b.start();
+      tlsTargets.set(attached);
+      return ctl;
     } catch (e) {
       lastErr = e;
     }
@@ -105,7 +188,7 @@ const rememberDb = (pid, coll, db) => {
 };
 const recallDb = (pid, coll) => (coll ? dbByColl.get(`${pid}\u0000${coll}`) : undefined);
 
-export const stats = signal({ tracked: 0, cmdRate: 0, readRate: 0, writeRate: 0, slowest: 0 });
+export const stats = signal({ tracked: 0, cmdRate: 0, readRate: 0, writeRate: 0, slowest: 0, tlsRate: 0, wireRate: 0 });
 export const status = signal("starting…");
 
 // Kernel-side slow-command floor, in microseconds. Patched live into the BPF
@@ -163,6 +246,9 @@ export function decode(ev) {
     dbInferred, // true when `$db` was recalled, not read off this command
     coll: parsed.coll,
     opcode,
+    // SRC_WIRE (0) = read off the socket in plaintext; SRC_TLS (1) = read
+    // inside an encrypted connection at the TLS boundary.
+    isTls: ev.source === 1,
     // The label the UI shows when there's no decodable body.
     opLabel: opcode === OP.COMPRESSED ? "compressed" : opcode === OP.QUERY ? "legacy" : "",
     shape: opcode === OP.MSG ? shapeString(filter) : "",
@@ -191,7 +277,7 @@ export const commands = from((state) => {
   let logId = 0; // monotonic row id
   let total = 0; // cumulative commands seen (title-bar counter)
   let dirty = false; // did the log change since the last publish?
-  const win = { cmds: 0, reads: 0, writes: 0, slowest: 0 }; // reset each window
+  const win = { cmds: 0, reads: 0, writes: 0, slowest: 0, tls: 0, wire: 0 }; // reset each window
 
   const sub = load()
     .then((ctl) => {
@@ -212,6 +298,8 @@ export const commands = from((state) => {
 
         if (!rec.isNoise) {
           win.cmds++;
+          if (rec.isTls) win.tls++;
+          else win.wire++;
           if (rec.isWrite) win.writes++;
           else win.reads++;
           if (rec.latUs > win.slowest) win.slowest = rec.latUs;
@@ -232,8 +320,10 @@ export const commands = from((state) => {
       readRate: win.reads / secs,
       writeRate: win.writes / secs,
       slowest: win.slowest,
+      tlsRate: win.tls / secs,
+      wireRate: win.wire / secs,
     });
-    win.cmds = win.reads = win.writes = win.slowest = 0;
+    win.cmds = win.reads = win.writes = win.slowest = win.tls = win.wire = 0;
   };
   const h = setInterval(publish, WINDOW_MS);
 
@@ -261,7 +351,7 @@ if (isEntry) {
   rb.subscribe((w) => {
     const ev = unwrap(w);
     const r = decode(ev);
-    const head = `[${opName[r.opcode] ?? r.opcode}] ${r.comm}/${r.pid} req=${r.requestId}`;
+    const head = `[${opName[r.opcode] ?? r.opcode}] ${r.isTls ? "TLS " : "wire"} ${r.comm}/${r.pid} req=${r.requestId}`;
     const lat = `${(r.latUs / 1000).toFixed(2)}ms`;
     console.log(
       `${head} ${r.cmd || "?"} ns=${r.ns || "?"}${r.dbInferred ? "~" : ""} shape=${r.shape || "-"} lat=${lat} ` +

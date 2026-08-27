@@ -55,6 +55,13 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 // MongoDB wire opcodes. OP_MSG is everything modern; the others are recognised
 // only so we can label traffic we deliberately don't decode rather than drop it
 // silently and look like we missed it.
+// How a command was observed. The plaintext socket path and the TLS path feed
+// the same ring buffer and the same analysis; only the tag differs, so the UI
+// can show the split and an engineer can tell at a glance that encrypted
+// traffic is actually being read.
+#define SRC_WIRE 0 // tcp_sendmsg/tcp_recvmsg — plaintext on the wire
+#define SRC_TLS  1 // SSL_write/SSL_read — read INSIDE encrypted connections
+
 #define OP_MSG        2013
 #define OP_COMPRESSED 2012
 #define OP_QUERY      2004 // legacy, pre-3.6 and the initial handshake
@@ -76,6 +83,7 @@ struct mongo_event {
 	__u32 request_id;         // the protocol's own correlation id
 	__u32 opcode;             // OP_MSG | OP_COMPRESSED | OP_QUERY
 	__u32 body_len;           // valid bytes in `body`
+	__u32 source;             // SRC_WIRE | SRC_TLS
 	char comm[TASK_COMM_LEN]; // client process
 	char cmd[CMD_LEN];        // command verb: find, insert, aggregate, ...
 	char ns[NS_LEN];          // "db.collection", assembled in userspace-friendly form
@@ -107,7 +115,11 @@ struct inflight {
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
-	__type(key, __u32); // requestID
+	// Keyed by (pid << 32 | requestID), NOT requestID alone. Drivers restart
+	// requestID at 1 per connection, so two short-lived clients collide and a
+	// reply pairs against the wrong process's request — which shows up as an
+	// absurd latency (a reply "answering" a request from seconds earlier).
+	__type(key, __u64);
 	__type(value, struct inflight);
 } inflight SEC(".maps");
 
@@ -127,6 +139,16 @@ struct {
 	__type(key, __u64); // pid_tgid
 	__type(value, struct recv_scratch);
 } recv_scratch SEC(".maps");
+
+// The SSL_read equivalent of recv_scratch. Kept separate from the wire path's
+// map so a process doing both plaintext and TLS on the same thread can't have
+// one path clobber the other's pending buffer.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64); // pid_tgid
+	__type(value, struct recv_scratch);
+} ssl_recv_scratch SEC(".maps");
 
 // The event we're building, kept in a per-CPU array rather than on the stack.
 // `struct mongo_event` is well over the 512-byte BPF stack limit once the BSON
@@ -292,7 +314,8 @@ int BPF_KPROBE(on_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
 	if (opcode == OP_MSG)
 		parse_op_msg(fl->body, fl->body_len, fl);
 
-	bpf_map_update_elem(&inflight, &request_id, fl, BPF_ANY);
+	__u64 ikey = ((__u64)fl->pid << 32) | request_id;
+	bpf_map_update_elem(&inflight, &ikey, fl, BPF_ANY);
 	return 0;
 }
 
@@ -335,20 +358,21 @@ int BPF_KRETPROBE(on_recvmsg_ret, int ret)
 	if (response_to == 0)
 		return 0; // not a reply to anything we tracked
 
-	struct inflight *fl = bpf_map_lookup_elem(&inflight, &response_to);
+	__u64 ikey = ((__u64)(bpf_get_current_pid_tgid() >> 32) << 32) | response_to;
+	struct inflight *fl = bpf_map_lookup_elem(&inflight, &ikey);
 	if (!fl)
 		return 0; // reply to a request sent before we attached
 
 	__u64 lat_us = (bpf_ktime_get_ns() - fl->ts) / 1000;
 	if (lat_us < min_latency_us) { // kernel-side slow-command floor
-		bpf_map_delete_elem(&inflight, &response_to);
+		bpf_map_delete_elem(&inflight, &ikey);
 		return 0;
 	}
 
 	__u32 zero = 0;
 	struct mongo_event *e = bpf_map_lookup_elem(&event_scratch, &zero);
 	if (!e) {
-		bpf_map_delete_elem(&inflight, &response_to);
+		bpf_map_delete_elem(&inflight, &ikey);
 		return 0;
 	}
 
@@ -360,12 +384,162 @@ int BPF_KRETPROBE(on_recvmsg_ret, int ret)
 	e->request_id = response_to;
 	e->opcode     = fl->opcode;
 	e->body_len   = fl->body_len;
+	e->source     = SRC_WIRE;
 	__builtin_memcpy(e->comm, fl->comm, TASK_COMM_LEN);
 	__builtin_memcpy(e->cmd, fl->cmd, CMD_LEN);
 	__builtin_memcpy(e->ns, fl->ns, NS_LEN);
 	__builtin_memcpy(e->body, fl->body, BODY_LEN);
 
 	bpf_ringbuf_output(&mongo_events, e, sizeof(*e), 0);
-	bpf_map_delete_elem(&inflight, &response_to);
+	bpf_map_delete_elem(&inflight, &ikey);
+	return 0;
+}
+
+// ─── TLS path ───────────────────────────────────────────────────────────────
+//
+// Everything above reads the socket, which means it sees nothing at all once
+// the connection is encrypted. These two programs hook the TLS library instead,
+// on the application's side of the encryption boundary: SSL_write is called
+// with the plaintext the app wants to send, SSL_read returns the plaintext the
+// app just received. Same OP_MSG bytes, same parser, same requestID pairing —
+// the only difference is where the buffer comes from.
+//
+// Attaching is the interesting part, and it is handled in probes/mongo.js:
+//
+//   - Clients using the SYSTEM OpenSSL (Python's _ssl, distro Node, .NET) are
+//     covered by one attach to libssl.so.
+//   - Node's OFFICIAL builds statically link BoringSSL, so there is no libssl
+//     to hook. BoringSSL keeps the OpenSSL symbol names, though, and the Node
+//     binary is not stripped — `SSL_write` is a global text symbol in the
+//     executable itself. So we attach per-binary instead. Verified against
+//     mongosh 2.10.0: SSL_write at 0x1acf654, 1653 SSL symbols exported.
+//
+// Not covered: Go (crypto/tls is pure Go, no C symbol to hook) and Java (JSSE
+// lives inside the JVM). Those are stated as limits, not worked around.
+//
+// Both programs pair through the SAME `inflight` map as the wire path, so a
+// TLS command gets a real round-trip latency rather than the zero redissnoop's
+// TLS rows carry — SSL_read is what makes that possible.
+
+// int SSL_write(SSL *ssl, const void *buf, int num)
+SEC("uprobe/SSL_write")
+int BPF_UPROBE(on_ssl_write, void *ssl, const void *buf, int num)
+{
+	if (!buf || num < 16)
+		return 0;
+
+	__u32 zero = 0;
+	struct inflight *fl = bpf_map_lookup_elem(&fl_scratch, &zero);
+	if (!fl)
+		return 0;
+	__builtin_memset(fl, 0, sizeof(*fl));
+
+	if (bpf_probe_read_user(fl->body, BODY_LEN, buf) != 0)
+		return 0;
+
+	// Same validation as the wire path: the header's messageLength must match
+	// the write and responseTo must be zero on a request. This is what keeps
+	// non-Mongo TLS traffic (an HTTPS call from the same process) out of the
+	// feed — the uprobe fires for every TLS write the binary makes, not just
+	// the database ones.
+	__u32 msg_len = le32(fl->body);
+	if (msg_len != (__u32)num)
+		return 0;
+
+	__u32 request_id  = le32(fl->body + 4);
+	__u32 response_to = le32(fl->body + 8);
+	__u32 opcode      = le32(fl->body + 12);
+	if (response_to != 0 || request_id == 0)
+		return 0;
+	if (opcode != OP_MSG && opcode != OP_COMPRESSED && opcode != OP_QUERY)
+		return 0;
+
+	fl->ts        = bpf_ktime_get_ns();
+	__u64 id      = bpf_get_current_pid_tgid();
+	fl->pid       = id >> 32;
+	fl->tid       = (__u32)id;
+	fl->req_bytes = msg_len;
+	fl->opcode    = opcode;
+	fl->body_len  = (__u32)num < BODY_LEN ? (__u32)num : BODY_LEN;
+	bpf_get_current_comm(&fl->comm, sizeof(fl->comm));
+
+	if (opcode == OP_MSG)
+		parse_op_msg(fl->body, fl->body_len, fl);
+
+	// No separate "this was TLS" marker is needed: each emit path knows its own
+	// source, because a request written through SSL_write is answered through
+	// SSL_read and emitted by that retprobe as SRC_TLS.
+	__u64 ikey = ((__u64)fl->pid << 32) | request_id;
+	bpf_map_update_elem(&inflight, &ikey, fl, BPF_ANY);
+	return 0;
+}
+
+// int SSL_read(SSL *ssl, void *buf, int num) — the buffer is filled on RETURN,
+// so the entry probe only records where it will land.
+SEC("uprobe/SSL_read")
+int BPF_UPROBE(on_ssl_read, void *ssl, void *buf, int num)
+{
+	struct recv_scratch rs = { .base = (__u64)buf };
+	__u64 key = bpf_get_current_pid_tgid();
+	bpf_map_update_elem(&ssl_recv_scratch, &key, &rs, BPF_ANY);
+	return 0;
+}
+
+SEC("uretprobe/SSL_read")
+int BPF_URETPROBE(on_ssl_read_ret, int ret)
+{
+	__u64 key = bpf_get_current_pid_tgid();
+	struct recv_scratch *rs = bpf_map_lookup_elem(&ssl_recv_scratch, &key);
+	if (!rs)
+		return 0;
+	__u64 base = rs->base;
+	bpf_map_delete_elem(&ssl_recv_scratch, &key);
+
+	if (ret < 16)
+		return 0;
+
+	__u8 hdr[16];
+	if (bpf_probe_read_user(hdr, sizeof(hdr), (const void *)base) != 0)
+		return 0;
+
+	__u32 resp_len    = le32(hdr);
+	__u32 response_to = le32(hdr + 8);
+	if (response_to == 0)
+		return 0;
+
+	__u64 ikey = ((__u64)(bpf_get_current_pid_tgid() >> 32) << 32) | response_to;
+	struct inflight *fl = bpf_map_lookup_elem(&inflight, &ikey);
+	if (!fl)
+		return 0;
+
+	__u64 lat_us = (bpf_ktime_get_ns() - fl->ts) / 1000;
+	if (lat_us < min_latency_us) {
+		bpf_map_delete_elem(&inflight, &ikey);
+		return 0;
+	}
+
+	__u32 zero = 0;
+	struct mongo_event *e = bpf_map_lookup_elem(&event_scratch, &zero);
+	if (!e) {
+		bpf_map_delete_elem(&inflight, &ikey);
+		return 0;
+	}
+
+	e->pid        = fl->pid;
+	e->tid        = fl->tid;
+	e->lat_us     = (__u32)lat_us;
+	e->req_bytes  = fl->req_bytes;
+	e->resp_bytes = resp_len;
+	e->request_id = response_to;
+	e->opcode     = fl->opcode;
+	e->body_len   = fl->body_len;
+	e->source     = SRC_TLS;
+	__builtin_memcpy(e->comm, fl->comm, TASK_COMM_LEN);
+	__builtin_memcpy(e->cmd, fl->cmd, CMD_LEN);
+	__builtin_memcpy(e->ns, fl->ns, NS_LEN);
+	__builtin_memcpy(e->body, fl->body, BODY_LEN);
+
+	bpf_ringbuf_output(&mongo_events, e, sizeof(*e), 0);
+	bpf_map_delete_elem(&inflight, &ikey);
 	return 0;
 }

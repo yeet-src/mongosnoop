@@ -29,6 +29,7 @@ export const C_READ = rgb(94, 234, 212); // read commands — teal
 export const C_WRITE = rgb(251, 146, 60); // write commands — orange
 export const C_BAD = rgb(248, 113, 113); // footguns / errors — red
 export const C_WARN = rgb(253, 186, 116); // caveats (truncated, inferred)
+export const C_TLS = rgb(167, 243, 208); // encrypted-source marker — mint
 
 export const C_SEL_BG = rgb(38, 66, 104); // selection bar
 export const C_SEL_FG = rgb(255, 255, 255);

@@ -3,7 +3,7 @@
 import { Box, Text } from "yeet:tui";
 import { commands, stats, status } from "@/probes/mongo.js";
 import {
-  C_BAD, C_BRAND, C_DIM, C_RAIL, C_READ, C_TITLE, C_WARN, C_WRITE,
+  C_BAD, C_BRAND, C_DIM, C_RAIL, C_READ, C_TITLE, C_TLS, C_WARN, C_WRITE,
   fmtDuration, fmtRate,
 } from "@/lib/format.js";
 
@@ -37,6 +37,18 @@ export default function TitleBar({ frozen, pinned, filter }) {
             <Text fg={C_WRITE}>{`▲${fmtRate(s.writeRate)}`}</Text>,
             <Text fg={C_DIM}>{" write"}</Text>,
           );
+
+          // The plaintext/encrypted split. This is the proof that the TLS path
+          // is live: an encrypted count above zero means the tool is reading
+          // inside connections the socket probes cannot see at all.
+          if (s.tlsRate > 0 || s.wireRate > 0) {
+            out.push(
+              sep(),
+              <Text fg={C_TLS}>{`🔒${fmtRate(s.tlsRate)}`}</Text>,
+              <Text fg={C_DIM}>{" tls "}</Text>,
+              <Text fg={C_DIM}>{`${fmtRate(s.wireRate)} plain`}</Text>,
+            );
+          }
 
           // The slowest command in the last window — the number you actually
           // watch when you're chasing a latency spike.
