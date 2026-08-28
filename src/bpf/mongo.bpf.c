@@ -174,17 +174,49 @@ struct {
 // depending on kernel version and how the driver issues the write, so both are
 // handled. This is the one fragile read here, and it is the same read
 // redissnoop makes.
+// A local mirror of the parts of `struct iov_iter` we read, declared with BOTH
+// spellings of the iovec pointer. vmlinux.h is generated from the running
+// kernel's BTF and carries only the name THAT kernel has, so naming the other
+// one directly is a compile error rather than something CO-RE can resolve at
+// load time. Declaring our own struct gives clang both names to compile
+// against, and `preserve_access_index` lets CO-RE relocate whichever one the
+// target kernel actually has.
+//
+// The rename landed in 6.4: `iov_iter.iov` became `__iov` when the union gained
+// an anonymous wrapper. Without this, the object builds on 6.4+ and fails to
+// compile on 6.1 — which is exactly what the kernel matrix caught.
+struct iov_iter___compat {
+	__u8 iter_type;
+	union {
+		void *ubuf;
+		const struct iovec *iov;   // <= 6.3
+		const struct iovec *__iov; // >= 6.4
+	};
+} __attribute__((preserve_access_index));
+
+struct msghdr___compat {
+	struct iov_iter___compat msg_iter;
+} __attribute__((preserve_access_index));
+
 static __always_inline const void *iter_base(struct msghdr *msg)
 {
-	__u8 itype = BPF_CORE_READ(msg, msg_iter.iter_type);
+	struct msghdr___compat *m = (void *)msg;
+
+	__u8 itype = BPF_CORE_READ(m, msg_iter.iter_type);
 	if (itype == ITER_UBUF)
-		return BPF_CORE_READ(msg, msg_iter.ubuf);
-	if (itype == ITER_IOVEC) {
-		const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
-		if (iov)
-			return BPF_CORE_READ(iov, iov_base);
-	}
-	return NULL;
+		return BPF_CORE_READ(m, msg_iter.ubuf);
+	if (itype != ITER_IOVEC)
+		return NULL;
+
+	const struct iovec *iov = NULL;
+	if (bpf_core_field_exists(m->msg_iter.__iov))
+		iov = BPF_CORE_READ(m, msg_iter.__iov);
+	else
+		iov = BPF_CORE_READ(m, msg_iter.iov);
+
+	if (!iov)
+		return NULL;
+	return BPF_CORE_READ(iov, iov_base);
 }
 
 // Little-endian int32 out of a byte window. The wire protocol is LE on every
