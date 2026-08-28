@@ -67,7 +67,11 @@ if ! "$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHos
 	exit 1
 fi
 
+# One client at a time. Overlapping mongosh runs interleave in the feed, which
+# breaks every N+1 into alternating rows and defeats the repeat rail — the
+# thing the feed exists to make visible.
 while true; do
 	"$MONGOSH" --quiet --tls --tlsCAFile "$CERTS/cert.pem" --tlsAllowInvalidHostnames --tlsAllowInvalidCertificates \
 		--host 127.0.0.1 --port "$PORT" "$DIR/tls-workload.js" >/dev/null 2>&1 || true
+	sleep 1
 done

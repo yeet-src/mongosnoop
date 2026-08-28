@@ -11,7 +11,7 @@
 // repetition rather than something you'd infer from a counter.
 import { Box, Text } from "yeet:tui";
 import {
-  C_BAD, C_CMD, C_DIM, C_FIELD, C_MATCH_BG, C_NS, C_READ, C_SEL_BG, C_SHAPE,
+  C_BAD, C_CMD, C_DIM, C_FAINT, C_FIELD, C_MATCH_BG, C_NS, C_READ, C_SEL_BG, C_SHAPE,
   C_TEXT, C_TLS, C_VALUE, C_WARN, C_WRITE,
   clip, fmtBytes, fmtDuration, fmtValues, heat, latFrac, lpad, pad, rowHeight,
 } from "@/lib/format.js";
@@ -42,7 +42,7 @@ const hl = (text, fg, q) => {
   return out;
 };
 
-function CmdRow({ c, sel, q }) {
+function CmdRow({ c, sel, q, repeat }) {
   const lat = heat(latFrac(c.latUs));
   const verbColor = c.footgun ? C_BAD : c.isWrite ? C_WRITE : C_CMD;
 
@@ -55,40 +55,65 @@ function CmdRow({ c, sel, q }) {
   // rather than read off this one — an inference, flagged as one.
   const nsText = `${c.ns || "?"}${c.dbInferred ? "~" : ""}`;
 
+  // Source marker. A text glyph, not an emoji: emoji are double-width and
+  // shift every following column by a cell, which broke the alignment of the
+  // whole feed. `tls` also reads as itself with no legend needed.
+  const src = c.isTls ? "tls" : "";
+
+  // The repeat rail. When this row's shape+namespace matches the row above it,
+  // draw a continuation bar instead of restating the shape. That turns an N+1
+  // from "twenty-five rows a reader must notice are identical" into one
+  // visually contiguous block — the pattern becomes a shape on screen rather
+  // than something to infer.
+  const bar = repeat ? "│" : "├";
+
   return (
     <Box direction="column" bg={sel ? C_SEL_BG : undefined}>
       <Box direction="row" height="1">
-        {/* The lock gets its own fixed cell. It is a wide glyph, so it must
-            not share a column with text or the row shifts by one cell. */}
-        <Text width="2" break="none" fg={C_TLS}>{c.isTls ? "🔒" : "  "}</Text>
-        <Box width="15" overflow="hidden">
-          {/* comm is up to 16 chars and the pid can be 7 — clip the NAME and
-              keep the pid intact, since the pid is what tells two instances of
-              the same binary apart. */}
-          <Text break="none" fg={C_DIM}>{pad(`${clip(c.comm, 7)}/${c.pid}`, 15)}</Text>
+        <Text width="4" break="none" fg={C_TLS}>{pad(src, 4)}</Text>
+        <Box width="13" overflow="hidden">
+          {/* comm often carries a second word ("mongosh mongodb", "node
+              server"); the first token is the identity, the rest is noise in a
+              13-column gutter. */}
+          <Text break="none" fg={C_DIM}>{pad(clip(`${c.comm.split(" ")[0]}/${c.pid}`, 12), 13)}</Text>
         </Box>
-        <Box width="15" overflow="hidden">
+        <Box width="14" overflow="hidden">
           <Text break="none" overflow="ellipsis" bold fg={verbColor}>{hl(c.cmd, verbColor, q)}</Text>
         </Box>
-        <Box width="26" overflow="hidden">
+        <Box width="24" overflow="hidden">
           <Text break="none" overflow="ellipsis" fg={C_NS}>{hl(nsText, C_NS, q)}</Text>
         </Box>
-        <Box width="1fr" overflow="hidden">
-          <Text break="none" overflow="ellipsis" fg={shapeColor}>{hl(shapeText, shapeColor, q)}</Text>
+        <Text width="2" break="none" fg={repeat ? C_FAINT : C_DIM}>{bar}</Text>
+        <Box width="34" overflow="hidden">
+          {/* A continuation row shows NO shape text at all — only the rail.
+              Dimming still asks the eye to parse twenty-five copies of the same
+              string; blanking collapses them into one visual block, so what you
+              read is "this query, twenty-five times" rather than a wall. The
+              shape is restated whenever the run breaks. */}
+          <Text break="none" overflow="ellipsis" fg={shapeColor}>
+            {repeat ? "" : hl(shapeText, shapeColor, q)}
+          </Text>
         </Box>
         <Text width="8" break="none" fg={C_DIM}>{lpad(fmtBytes(c.respBytes), 8)}</Text>
-        <Text width="10" break="none" bold fg={lat}>{lpad(fmtDuration(c.latUs), 10)}</Text>
+        <Text width="9" break="none" bold fg={lat}>{lpad(fmtDuration(c.latUs), 9)}</Text>
+        <Box width="1fr" />
       </Box>
 
       {c.values?.length ? (
         <Text height="1" break="none" overflow="ellipsis" fg={C_FIELD}>
-          {"   ↳ "}
-          <Text fg={C_VALUE}>{clip(fmtValues(c.values), 200)}</Text>
+          {/* Indent to the shape column: src(4) + process(13) + command(14) +
+              namespace(24) = 55, then the 2-col rail. */}
+          {`${" ".repeat(55)}`}
+          <Text fg={C_FAINT}>{repeat ? "│ " : "  "}</Text>
+          <Text fg={C_VALUE}>{clip(fmtValues(c.values), 120)}</Text>
         </Text>
       ) : null}
 
       {c.footgun ? (
-        <Text height="1" break="none" overflow="ellipsis" fg={C_BAD}>{`   ⚠ ${c.footgun}`}</Text>
+        <Text height="1" break="none" overflow="ellipsis">
+          <Text fg={C_FAINT}>{`${" ".repeat(55)}${repeat ? "│ " : "  "}`}</Text>
+          <Text fg={C_BAD}>{`⚠ ${c.footgun}`}</Text>
+        </Text>
       ) : null}
     </Box>
   );
@@ -120,7 +145,16 @@ export default function Commands({ visible, size, scroll, selected, filter, foot
         let used = 0;
         for (let i = offset; i < list.length && used < budget; i++) {
           const c = list[i];
-          out.push(<CmdRow c={c} sel={i === cur} q={q} />);
+          // Newest-first, so the row rendered ABOVE this one is i-1. Same shape
+          // against the same namespace means this is a continuation.
+          const prev = list[i - 1];
+          const repeat =
+            !!prev &&
+            prev.pid === c.pid && // a run is within ONE process — two clients
+            prev.shape === c.shape && // issuing the same query are not a loop
+            prev.ns === c.ns &&
+            prev.cmd === c.cmd;
+          out.push(<CmdRow c={c} sel={i === cur} q={q} repeat={repeat} />);
           used += rowHeight(c);
         }
         return out;
@@ -134,13 +168,15 @@ export default function Commands({ visible, size, scroll, selected, filter, foot
 export function CommandsHeader() {
   return (
     <Box direction="row" height="1">
+      <Text width="4" fg={C_DIM}>{pad("src", 4)}</Text>
+      <Text width="13" fg={C_DIM}>{pad("process", 13)}</Text>
+      <Text width="14" fg={C_DIM}>{pad("command", 14)}</Text>
+      <Text width="24" fg={C_DIM}>{pad("namespace", 24)}</Text>
       <Text width="2" fg={C_DIM}>{"  "}</Text>
-      <Text width="15" fg={C_DIM}>{pad("process", 15)}</Text>
-      <Text width="15" fg={C_DIM}>{pad("command", 15)}</Text>
-      <Text width="26" fg={C_DIM}>{pad("namespace", 26)}</Text>
-      <Text width="1fr" fg={C_DIM}>{"query shape"}</Text>
+      <Text width="34" fg={C_DIM}>{pad("query shape", 34)}</Text>
       <Text width="8" fg={C_DIM}>{lpad("resp", 8)}</Text>
-      <Text width="10" fg={C_DIM}>{lpad("latency", 10)}</Text>
+      <Text width="9" fg={C_DIM}>{lpad("latency", 9)}</Text>
+      <Box width="1fr" />
     </Box>
   );
 }

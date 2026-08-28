@@ -44,9 +44,10 @@ export default function TitleBar({ frozen, pinned, filter }) {
           if (s.tlsRate > 0 || s.wireRate > 0) {
             out.push(
               sep(),
-              <Text fg={C_TLS}>{`🔒${fmtRate(s.tlsRate)}`}</Text>,
-              <Text fg={C_DIM}>{" tls "}</Text>,
-              <Text fg={C_DIM}>{`${fmtRate(s.wireRate)} plain`}</Text>,
+              <Text fg={C_DIM}>{"encrypted "}</Text>,
+              <Text bold fg={C_TLS}>{fmtRate(s.tlsRate)}</Text>,
+              <Text fg={C_DIM}>{"  plaintext "}</Text>,
+              <Text bold fg={C_TITLE}>{fmtRate(s.wireRate)}</Text>,
             );
           }
 
