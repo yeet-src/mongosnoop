@@ -10,6 +10,10 @@
   <a href="https://discord.gg/JxVseaAVAU"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Discord"></a>
 </p>
 
+<p align="center">
+  <img src="assets/mongosnoop.gif" width="820" alt="mongosnoop streaming live MongoDB commands read inside TLS, with an N+1 collapsed into a single block">
+</p>
+
 **`mongosnoop` shows what your application is actually doing to MongoDB.** Each row is one command with its **query shape** — the filter with every value stripped, so `{customer_id: ObjectId(…), status: "pending"}` becomes `{customer_id, status}` — and the concrete values on the line beneath it. When the same shape repeats, the rows collapse into a single block with a continuation rail, so a query running inside a loop reads as *one thing happening twenty-five times* instead of twenty-five rows you have to notice are identical.
 
 > [!TIP]
@@ -45,13 +49,15 @@ The feed follows the newest command by default; move the cursor off the top row 
 
 ```
 src process      command       namespace                 query shape           resp  latency
-tls mongosh/8875 find          payments.charges        ├{status, tenant_id}   383B    1.3ms
-                                                         tenant_id=14  status="pending"
-tls mongosh/8875 find          payments.charges        │                      383B    1.4ms
+tls mongosh/2551 find          payments.charges        ├{status, tenant_id}   383B    650µs
+                                                         tenant_id=15  status="pending"
+tls mongosh/2551 find          payments.charges        │                      383B    579µs
+                                                       │ tenant_id=14  status="pending"
+tls mongosh/2551 find          payments.charges        │                      383B    491µs
                                                        │ tenant_id=13  status="pending"
-tls mongosh/8875 find          payments.charges        │                      383B    917µs
-                                                       │ tenant_id=12  status="pending"
-    node/4471    find          payments.charges        ├{$where}              2.8K   65.6ms
+tls mongosh/2551 update        payments.charges~       ├{tenant_id}            60B    564µs
+                                                         tenant_id=3
+tls mongosh/2549 find          payments.charges        ├{$where}              2.8K   62.4ms
                                                          $where="this.amount > 4500"
                                                          ⚠ $where runs JS per document and can't use an index
 ```
