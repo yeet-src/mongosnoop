@@ -7,7 +7,7 @@
   <a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux-1793D1" alt="Linux: BTF-capable kernel 6.1 or newer"></a>
   <a href="https://yeet.cx/docs/?utm_source=github&utm_medium=readme&utm_campaign=mongosnoop&utm_content=badge"><img src="https://img.shields.io/badge/built%20with-yeet%20%2B%20eBPF-8A2BE2" alt="Built with yeet: kprobes on tcp_sendmsg and uprobes on SSL_write, loaded by the yeet daemon"></a>
   <a href="#how-it-works"><img src="https://img.shields.io/badge/hooks-kprobes%20%2B%20TLS%20uprobes-FF8C00" alt="Hooks: tcp_sendmsg/tcp_recvmsg kprobes plus SSL_write/SSL_read uprobes"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-Dual%20BSD%2FGPL-3DA639" alt="License: Dual BSD/GPL"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-3DA639" alt="Apache-2.0"></a>
   <a href="https://discord.gg/JxVseaAVAU"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Chat with the yeet community on Discord"></a>
 </p>
 
@@ -388,7 +388,7 @@ Yes. The kprobes are host-wide and see every process on the box regardless of na
 
 ## License
 
-Dual BSD/GPL.
+Apache-2.0.
 
 ---
 
