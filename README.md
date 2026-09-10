@@ -19,8 +19,18 @@
 
 ## Quick start
 
+Install yeet first if you have not already:
+
 ```sh
-curl -fsSL https://yeet.cx | sh   # install yeet, once
+curl -fsSL https://yeet.cx | sh
+yeet login
+```
+
+Or follow the [manual installation guide](https://yeet.cx/docs/manual-installation?utm_source=github&utm_medium=readme&utm_campaign=mongosnoop).
+
+Then run it:
+
+```sh
 yeet run gh:yeet-src/mongosnoop   # clone, build and run in one step
 ```
 
@@ -40,12 +50,33 @@ MongoDB's database profiler is server-side, off by default, samples at a thresho
 
 ## Get started
 
+Linux only. Install yeet first if you have not already:
+
 ```sh
 curl -fsSL https://yeet.cx | sh
+yeet login
+```
+
+Or follow the [manual installation guide](https://yeet.cx/docs/manual-installation?utm_source=github&utm_medium=readme&utm_campaign=mongosnoop).
+
+Then build and run it:
+
+```sh
 make            # clang + bpftool → bin/probe.bpf.o ; esbuild → the JS bundle
 yeet run .      # watch every plaintext MongoDB connection on the host
 ```
-[Manual install guide](https://yeet.cx/docs/manual-installation?utm_source=github&utm_medium=readme&utm_campaign=mongosnoop) | Linux only
+
+In a second window, give it something to watch. Your own application works;
+if you have none handy, `demo/run.sh` stands up a throwaway MongoDB in Docker
+and drives it:
+
+```sh
+demo/run.sh     # plaintext on :27017, an N+1 loop and each flagged pattern
+```
+
+Start `mongosnoop` before the traffic, since a uprobe cannot see a process that
+was already running. There is a TLS demo too: see
+[Try it without real traffic](#try-it-without-real-traffic).
 
 With no flags it reads plaintext connections. Driver chatter (`hello`, `ping`, handshakes) is hidden by default, because an idle connection pool heartbeats every few seconds per connection and would otherwise bury your application's traffic; press `n` to show it.
 
@@ -70,6 +101,8 @@ Set up and verify github.com/yeet-src/mongosnoop on this machine.
 
 1. Clone it (or `git pull` if it's already here) and read AGENTS.md.
 2. Install yeet if it isn't present: curl -fsSL https://yeet.cx | sh
+   Then `yeet login`, which is interactive and needs a browser. If no one is
+   at the keyboard, stop and say so rather than guessing.
 3. Run `make`. It fetches its own clang/bpftool/esbuild, so a missing system
    toolchain is not an error.
 4. Start traffic in a second shell: `demo/run.sh`
@@ -351,7 +384,7 @@ Both drive a workload that produces an N+1 loop, a few distinct shapes, and each
 
 > [!IMPORTANT]
 > - **A Linux kernel with BTF** (`CONFIG_DEBUG_INFO_BTF=y`) for CO-RE, which `bpftool` reads to generate `src/bpf/include/vmlinux.h`. Default on current Arch, Fedora, Ubuntu, and Debian. Verified on 6.1, 6.6, 6.12 and bpf-next; CO-RE means no per-kernel recompile.
-> - **The yeet daemon**, which performs the privileged BPF load. The capabilities are delegated to a daemonized process, so `mongosnoop` itself runs unprivileged. `curl -fsSL https://yeet.cx | sh` installs it.
+> - **The yeet daemon**, which performs the privileged BPF load. The capabilities are delegated to a daemonized process, so `mongosnoop` itself runs unprivileged. `curl -fsSL https://yeet.cx | sh` installs it, and `yeet login` completes the setup.
 > - **For encrypted traffic**, a client whose TLS is hookable, plus the path to its library or binary. See [Reading encrypted traffic](#reading-encrypted-traffic).
 >
 > To build from source you also need `clang` and `bpftool`, but the vendored static toolchain supplies them.
